@@ -1,0 +1,150 @@
+name: Automated PR Review
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  request-copilot-review:
+    runs-on: ubuntu-latest
+    # Only request on PR open/reopen, not every push
+    if: github.event.action == 'opened' || github.event.action == 'reopened'
+    steps:
+      - name: Request GitHub Copilot Review
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.pulls.requestReviewers({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              reviewers: ['copilot-pull-request-reviewer[bot]'],
+            });
+
+  review:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            npm-
+
+      - run: npm ci
+
+      - name: TypeScript Check
+        id: typecheck
+        run: npx tsc --noEmit 2>&1
+        continue-on-error: true
+
+      - name: Run Tests
+        id: tests
+        run: npx vitest --run 2>&1 | tee /tmp/test-output.txt
+        continue-on-error: true
+
+      - name: Run Coverage
+        id: coverage
+        run: npx vitest --coverage --run 2>&1 | tee /tmp/coverage-output.txt
+        continue-on-error: true
+
+      - name: Build Check
+        id: build
+        run: npm run build 2>&1
+        continue-on-error: true
+
+      - name: Post PR Review
+        uses: actions/github-script@v7
+        env:
+          TYPECHECK_OUTCOME: ${{ steps.typecheck.outcome }}
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
+          COVERAGE_OUTCOME: ${{ steps.coverage.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const { TYPECHECK_OUTCOME, TESTS_OUTCOME, COVERAGE_OUTCOME, BUILD_OUTCOME, RUN_URL } = process.env;
+
+            const icon = (outcome) => outcome === 'success' ? '✅' : '❌';
+
+            const allPassed =
+              TYPECHECK_OUTCOME === 'success' &&
+              TESTS_OUTCOME === 'success' &&
+              BUILD_OUTCOME === 'success';
+
+            const warnings = [];
+            if (TYPECHECK_OUTCOME === 'failure') warnings.push('⚠️ **TypeScript errors detected.** Fix type errors before merging.');
+            if (TESTS_OUTCOME === 'failure') warnings.push('⚠️ **Some tests are failing.** All tests must pass before merging.');
+            if (BUILD_OUTCOME === 'failure') warnings.push('⚠️ **Build failed.** The project must build successfully before merging.');
+
+            const body = [
+              '## 🤖 Automated PR Review',
+              '',
+              '| Check | Status |',
+              '|-------|--------|',
+              `| TypeScript | ${icon(TYPECHECK_OUTCOME)} \`${TYPECHECK_OUTCOME}\` |`,
+              `| Unit Tests | ${icon(TESTS_OUTCOME)} \`${TESTS_OUTCOME}\` |`,
+              `| Coverage | ${icon(COVERAGE_OUTCOME)} \`${COVERAGE_OUTCOME}\` |`,
+              `| Build | ${icon(BUILD_OUTCOME)} \`${BUILD_OUTCOME}\` |`,
+              '',
+              ...(warnings.length > 0 ? ['### Issues Found', ...warnings.map(w => `- ${w}`), ''] : []),
+              allPassed
+                ? '✨ **All checks passed!** This PR looks good to merge.'
+                : '🔍 Please review and fix the issues above before merging.',
+              '',
+              `_[View full workflow run](${RUN_URL})_`,
+            ].join('\n');
+
+            // Find existing bot comment to update instead of creating duplicates
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existingComment = comments.find(
+              (c) => c.user.type === 'Bot' && c.body.includes('🤖 Automated PR Review')
+            );
+
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+            // Submit a formal PR review
+            const event = allPassed ? 'APPROVE' : 'REQUEST_CHANGES';
+            const reviewBody = allPassed
+              ? '✅ All automated checks passed. Approving this PR.'
+              : '❌ One or more automated checks failed. Please fix the issues noted in the review comment.';
+
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              event,
+              body: reviewBody,
+            });
